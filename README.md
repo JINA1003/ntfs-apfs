@@ -6,7 +6,7 @@ Windows와 Mac에서 서로의 디스크를 읽고 쓰기 위한 개인용 도�
 |---|---|---|
 | `windows/` | **APFS 드라이브** (Windows 앱): Mac(APFS) SSD를 탐색기 드라이브로 붙여 읽고 쓴다 | 완료 (`dist/APFSDrive.exe`) |
 | `diskread.py` | NTFS·APFS 이미지/디스크 읽기 전용 CLI (Python 프로토타입) | 완료 |
-| Mac 앱 (NTFS 쓰기, `.dmg`) | Swift + FSKit + libntfs-3g로 계획 | 아직 |
+| Mac 앱 (NTFS 쓰기, `.dmg`) | Swift + FSKit + libntfs-3g. 인계 문서: [docs/mac-plan.md](docs/mac-plan.md) | 아직 |
 
 ## APFS 드라이브 (Windows)
 
@@ -57,7 +57,7 @@ windows/build.sh build --release     # → ~/build/apfsapp/x86_64-pc-windows-gnu
 ### 검증
 
 ```bash
-scripts/check.sh                     # 유일한 검증 명령: 빌드 → 단위 테스트 → smoke
+scripts/check.sh                     # 유일한 검증 명령. WSL에서는 windows/check.sh(빌드 → 단위 테스트 → smoke)까지 돈다
 windows/e2e/gui_e2e.sh dist/APFSDrive.exe   # GUI 종단 테스트 (UAC 클릭 필요)
 ```
 
