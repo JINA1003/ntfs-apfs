@@ -1,0 +1,27 @@
+// 앱 아이콘(ID 1, gui.rs가 불러 씀), 매니페스트(RT_MANIFEST=24), 버전 정보
+1 ICON "app.ico"
+1 24 "app.manifest"
+
+1 VERSIONINFO
+FILEVERSION 0,1,3,0
+PRODUCTVERSION 0,1,3,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "041204B0"
+    BEGIN
+      VALUE "FileDescription", "APFS 드라이브"
+      VALUE "ProductName", "APFS 드라이브 (winapfs 기반)"
+      VALUE "FileVersion", "0.1.3"
+      VALUE "ProductVersion", "0.1.3"
+      VALUE "OriginalFilename", "APFSDrive.exe"
+      VALUE "LegalCopyright", "MIT OR Apache-2.0; uses WinFsp (C) Bill Zissimopoulos"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0412, 1200
+  END
+END

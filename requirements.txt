@@ -1,0 +1,3 @@
+dissect.ntfs==3.16
+dissect.apfs==1.1
+pytest==9.2.0

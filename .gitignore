@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+
+# 빌드 결과물 (exe는 GitHub Release에 올린다)
+dist/
+
+# 테스트 작업 폴더
+windows/e2e/.work-*/
+
+# 로컬 Claude Code 설정
+.claude/
