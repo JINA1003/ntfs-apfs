@@ -19,6 +19,7 @@ pub struct OmapVal {
     pub paddr: u64,
 }
 
+#[derive(Clone)]
 pub struct Omap {
     pub flags: u32,
     pub snap_count: u32,

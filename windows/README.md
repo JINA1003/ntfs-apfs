@@ -138,7 +138,7 @@ Before a drive appears writable, winapfs reads its structure and checks the free
 </details>
 
 > [!WARNING]
-> **Writing is new.** It has been tested carefully, but not yet by thousands of people. Keep a backup of anything you cannot lose, and run `winapfs unmount M:` before unplugging (or wait a few seconds after your last change). Not supported for writing yet, these appear read-only: encrypted drives, volumes with snapshots, Fusion drives. macOS-compressed files and hard-linked files can be read but not changed.
+> **Writing is new.** It has been tested carefully, but not yet by thousands of people. Keep a backup of anything you cannot lose, and run `winapfs unmount M:` before unplugging (or wait a few seconds after your last change). Not supported for writing yet, these appear read-only: encrypted drives, Fusion drives, and the sealed macOS system volume (your files live on the "- Data" volume next to it, which can be written). Volumes with snapshots (Time Machine, macOS updates) can be written; the snapshots stay as they were. macOS-compressed files and hard-linked files can be read but not changed.
 
 ---
 

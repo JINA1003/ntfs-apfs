@@ -36,3 +36,37 @@ for _ in $(seq 1 120); do grep -q "^exit=" "$work/mount.log" && break; sleep 1; 
 grep -q "^exit=0" "$work/mount.log" && grep -q "result     consistent" "$work/mount.log" || { cat "$work/mount.log"; exit 1; }
 echo "post-write space check: consistent"
 .venv/bin/python windows/e2e/verify_apfs.py "$work/rw.img" "$work/ops/expected.txt"
+
+echo "== snapshot smoke (Windows)"
+# macOS가 만든 스냅샷 볼륨 이미지 (dissect.apfs 테스트 데이터, AGPL이라 저장소에 넣지 않고 받아 둔다).
+cache="$root/windows/e2e/.cache"; snap_gz="$cache/snapshot.bin.gz"
+if [ ! -f "$snap_gz" ]; then
+  mkdir -p "$cache"
+  .venv/bin/pip download -q --disable-pip-version-check --no-deps --no-binary :all: dissect.apfs==1.1 -d "$cache"
+  tar -xzf "$cache/dissect_apfs-1.1.tar.gz" -C "$cache" dissect_apfs-1.1/tests/_data/snapshot.bin.gz
+  mv "$cache/dissect_apfs-1.1/tests/_data/snapshot.bin.gz" "$snap_gz"; rm -rf "$cache/dissect_apfs-1.1" "$cache"/*.tar.gz
+fi
+gzip -dc "$snap_gz" > "$work/snap.img"
+lin="$(mktemp -d)"; trap 'rm -rf "$work" "$lin"' EXIT
+cp "$work/snap.img" "$lin/before.img"
+S="$W\\snap.img"
+head -c 3000000 /dev/urandom > "$work/big.bin"; printf 'replaced\n' > "$work/small.txt"
+"$exe" dev-put "$S" "$W\\big.bin" /big.bin >/dev/null
+"$exe" dev-mkdir "$S" /dir >/dev/null
+"$exe" dev-rm "$S" /.fseventsd/000000000006eba6 >/dev/null     # 스냅샷과 공유하는 파일
+"$exe" dev-put "$S" "$W\\small.txt" /.fseventsd/000000000006eba7 >/dev/null
+"$exe" dev-mv "$S" /.fseventsd/000000000006ebd3 /dir/moved >/dev/null
+"$exe" dev-space-check "$S" | grep -q "result     consistent" || { "$exe" dev-space-check "$S"; exit 1; }
+echo "post-write space check: consistent"
+cp "$work/snap.img" "$lin/after.img"
+.venv/bin/python windows/e2e/snapshot_hashes.py "$lin/before.img" 16 > "$lin/before.txt"
+.venv/bin/python windows/e2e/snapshot_hashes.py "$lin/after.img" 16 > "$lin/after.txt"
+cmp -s "$lin/before.txt" "$lin/after.txt" || { diff "$lin/before.txt" "$lin/after.txt" | head; exit 1; }
+echo "snapshots unchanged: $(wc -l < "$lin/after.txt") files (dissect.apfs)"
+printf '%s /big.bin\nabsent /.fseventsd/000000000006eba6\nabsent /.fseventsd/000000000006ebd3\n' "$(sha256sum "$work/big.bin" | cut -d' ' -f1)" > "$lin/expected.txt"
+.venv/bin/python windows/e2e/verify_apfs.py "$lin/after.img" "$lin/expected.txt"
+if docker image inspect apfsprogs >/dev/null 2>&1; then
+  docker run --rm -v "$lin:/work" apfsprogs apfsck -cw /work/after.img && echo "apfsck: clean"
+else
+  echo "apfsck: SKIPPED (docker build -t apfsprogs windows/tools/apfsprogs)"
+fi

@@ -34,7 +34,13 @@ const UNKNOWN_ID: u32 = 99;
 
 pub const FILE_EXTENT_LEN_MASK: u64 = 0x00ff_ffff_ffff_ffff;
 pub const PEXT_LEN_MASK: u64 = 0x0fff_ffff_ffff_ffff;
-const APFS_KIND_NEW: u64 = 1;
+/// Extent-reference record kinds: blocks the volume itself allocated, and
+/// a reference-count change to blocks a snapshot's tree records.
+pub const APFS_KIND_NEW: u64 = 1;
+pub const APFS_KIND_UPDATE: u64 = 2;
+pub const PEXT_KIND_SHIFT: u32 = 60;
+/// `owning_obj_id` of an update record.
+pub const OWNING_OBJ_ID_INVALID: u64 = !0;
 
 /// Fixed part of `j_inode_val_t`; extended fields follow.
 pub const INODE_FIXED: usize = 92;
@@ -131,9 +137,10 @@ pub fn phys_ext_key(start: u64) -> Vec<u8> {
     hdr(start, APFS_TYPE_EXTENT).to_vec()
 }
 
-/// `j_phys_ext_val_t`: `blocks` blocks used once, by data stream `owner`.
-pub fn phys_ext_val(blocks: u64, owner: u64, refcnt: i32) -> Vec<u8> {
-    let mut v = (blocks | APFS_KIND_NEW << 60).to_le_bytes().to_vec();
+/// `j_phys_ext_val_t`: `blocks` blocks of record kind `kind`, owned by data
+/// stream `owner`, with `refcnt` references.
+pub fn phys_ext_val(blocks: u64, kind: u64, owner: u64, refcnt: i32) -> Vec<u8> {
+    let mut v = (blocks | kind << PEXT_KIND_SHIFT).to_le_bytes().to_vec();
     v.extend(owner.to_le_bytes());
     v.extend(refcnt.to_le_bytes());
     v

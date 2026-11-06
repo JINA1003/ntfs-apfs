@@ -11,3 +11,6 @@ windows/e2e/.work-*/
 
 # 로컬 Claude Code 설정
 .claude/
+
+# 받아 둔 시험 이미지
+windows/e2e/.cache/

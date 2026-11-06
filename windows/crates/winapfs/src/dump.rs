@@ -467,6 +467,34 @@ impl Claims {
     }
 }
 
+/// The blocks a volume's file extents point at: file-extent records, or a
+/// sealed volume's file-extent tree and the blocks it points at.
+fn claim_file_data(c: &Container, v: &apfs::Volume, claims: &mut Claims, bs: u64) -> apfs::Result<()> {
+    let mut extent = |val: &[u8]| {
+        let len = u64::from_le_bytes(val[0..8].try_into().unwrap()) & 0x00ff_ffff_ffff_ffff;
+        let phys = u64::from_le_bytes(val[8..16].try_into().unwrap());
+        if phys != 0 {
+            claims.claim(phys, len.div_ceil(bs), "file data");
+        }
+    };
+    v.scan_all(&mut |k, val| {
+        if u64::from_le_bytes(k[0..8].try_into().unwrap()) >> 60 == 8 && val.len() >= 16 {
+            extent(val);
+        }
+        Ok(true)
+    })?;
+    v.scan_fext(&|_| Ok(std::cmp::Ordering::Equal), &mut |_, val| {
+        extent(val);
+        Ok(true)
+    })?;
+    if v.sb.is_sealed() {
+        for p in physical_tree_nodes(c, v.sb.fext_tree_oid)? {
+            claims.claim(p, 1, "file-extent tree node");
+        }
+    }
+    Ok(())
+}
+
 /// Every node of a physical B-tree.
 fn physical_tree_nodes(c: &Container, root_paddr: u64) -> apfs::Result<Vec<u64>> {
     let root = c.node(root_paddr)?;
@@ -616,16 +644,24 @@ pub fn space_check_container(c: &Container, location: &str) -> CliResult {
                 claims.claim(p, 1, "snapshot tree node");
             }
         }
-        v.scan_all(&mut |k, val| {
-            if u64::from_le_bytes(k[0..8].try_into().unwrap()) >> 60 == 8 && val.len() >= 16 {
-                let len = u64::from_le_bytes(val[0..8].try_into().unwrap()) & 0x00ff_ffff_ffff_ffff;
-                let phys = u64::from_le_bytes(val[8..16].try_into().unwrap());
-                if phys != 0 {
-                    claims.claim(phys, len.div_ceil(bs), "file data");
+        claim_file_data(&c, &v, &mut claims, bs)?;
+        let snap_tree = u64::from_le_bytes(c.raw_block(vsb.omap_oid)?[56..64].try_into().unwrap()); // om_snapshot_tree_oid
+        if snap_tree != 0 {
+            for p in physical_tree_nodes(&c, snap_tree)? {
+                claims.claim(p, 1, "object map snapshot tree node");
+            }
+        }
+        // A snapshot keeps its superblock copy, its extent-reference tree and
+        // the data its files had; the data is shared with the live volume.
+        for s in v.snapshots()? {
+            claims.claim(s.sblock_oid, 1, "snapshot superblock");
+            if s.extentref_tree_oid != 0 {
+                for p in physical_tree_nodes(&c, s.extentref_tree_oid)? {
+                    claims.claim(p, 1, "extent-reference tree node");
                 }
             }
-            Ok(true)
-        })?;
+            claim_file_data(&c, &v.snapshot(&s)?, &mut claims, bs)?;
+        }
     }
     // Blocks waiting in the main free queue stay allocated until released.
     let resolve =

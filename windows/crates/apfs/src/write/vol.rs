@@ -90,10 +90,12 @@ pub(super) struct VolState {
 
 impl VolState {
     pub fn open(v: &Volume) -> Result<Self> {
-        if v.sb.num_snapshots > 0 {
-            return Err(unsupported("writing to volumes that have snapshots"));
+        if v.sb.is_sealed() {
+            return Err(unsupported("writing to a sealed system volume"));
         }
-        let tree = Tree::open(&VolReader(v), v.sb.root_tree_oid, fs::key_cmp)?;
+        let mut tree = Tree::open(&VolReader(v), v.sb.root_tree_oid, fs::key_cmp)?;
+        // Tree nodes as old as the newest snapshot are that snapshot's too.
+        tree.keep_xid = v.snapshots()?.iter().map(|s| s.xid).max().unwrap_or(0);
         Ok(Self { tree, extref: None, apsb: v.sb.raw.clone(), data_alloced: 0, data_freed: 0, files: HashMap::new(), pending_io: None })
     }
 
@@ -671,7 +673,7 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         let fresh: Vec<Run> = runs.iter().filter(|r| r.fresh).copied().collect();
         for r in fresh {
             let x = self.extref()?;
-            x.upsert(&PhysReader(c), fs::phys_ext_key(r.phys), Some(fs::phys_ext_val(r.blocks, stream, 1)))?;
+            x.upsert(&PhysReader(c), fs::phys_ext_key(r.phys), Some(fs::phys_ext_val(r.blocks, fs::APFS_KIND_NEW, stream, 1)))?;
         }
         if self.get(&fs::dstream_id_key(stream))?.is_none() {
             self.put(fs::dstream_id_key(stream), fs::dstream_id_val(1))?;
@@ -736,33 +738,55 @@ impl<'a, 'c> VolEdit<'a, 'c> {
         Ok(())
     }
 
-    /// Frees `blocks` blocks from `phys` and takes them out of the
-    /// extent-reference tree, splitting a record that covers more.
+    /// Drops one reference to `blocks` blocks from `phys`, from the end of
+    /// the range back. A piece the volume's extent-reference tree records
+    /// loses a reference and is freed when none is left and the volume
+    /// allocated it itself (`KIND_NEW`). A piece the tree does not record
+    /// belongs to a snapshot, whose own tree holds it: it stays allocated
+    /// and gets an update record of -1 instead.
     fn release_extent(&mut self, t: &mut Txn, phys: u64, blocks: u64) -> Result<()> {
         let rd = PhysReader(self.v.container());
-        let x = self.extref()?;
-        let (k, v) = x
-            .floor(&rd, &fs::phys_ext_key(phys))?
-            .ok_or_else(|| corrupt(format!("no extent reference for block {phys:#x}")))?;
-        let v = v.ok_or_else(|| corrupt("extent reference without a value"))?;
-        let start = fs::key_id(&k);
-        let (rlen, owner, refcnt) = (u64_at(&v, 0)? & fs::PEXT_LEN_MASK, u64_at(&v, 8)?, u32_at(&v, 16)? as i32);
-        if start + rlen < phys + blocks {
-            return Err(corrupt(format!("blocks {phys:#x}+{blocks} are not covered by an extent reference")));
+        let snapshots = self.v.sb.num_snapshots > 0;
+        let mut end = phys + blocks;
+        while end > phys {
+            let x = self.extref()?;
+            let rec = match x.floor(&rd, &fs::phys_ext_key(end - 1))? {
+                Some((k, Some(v))) => {
+                    let len_kind = u64_at(&v, 0)?;
+                    let start = fs::key_id(&k);
+                    Some((k, start, start + (len_kind & fs::PEXT_LEN_MASK), len_kind >> fs::PEXT_KIND_SHIFT, u64_at(&v, 8)?, u32_at(&v, 16)? as i32))
+                }
+                Some(_) => return Err(corrupt("extent reference without a value")),
+                None => None,
+            };
+            match rec {
+                Some((k, start, rend, kind, owner, refcnt)) if rend >= end => {
+                    // Keep the parts of the record outside the range as they are.
+                    x.remove(&rd, &k)?;
+                    if start < phys {
+                        x.upsert(&rd, fs::phys_ext_key(start), Some(fs::phys_ext_val(phys - start, kind, owner, refcnt)))?;
+                    }
+                    if rend > end {
+                        x.upsert(&rd, fs::phys_ext_key(end), Some(fs::phys_ext_val(rend - end, kind, owner, refcnt)))?;
+                    }
+                    let s = start.max(phys);
+                    if refcnt != 1 {
+                        x.upsert(&rd, fs::phys_ext_key(s), Some(fs::phys_ext_val(end - s, kind, owner, refcnt - 1)))?;
+                    } else if kind == fs::APFS_KIND_NEW {
+                        t.space.free_run(s, end - s);
+                        self.st.data_freed += end - s;
+                    }
+                    end = s;
+                }
+                rec if snapshots => {
+                    let s = rec.map_or(phys, |r| r.2.max(phys));
+                    let val = fs::phys_ext_val(end - s, fs::APFS_KIND_UPDATE, fs::OWNING_OBJ_ID_INVALID, -1);
+                    x.upsert(&rd, fs::phys_ext_key(s), Some(val))?;
+                    end = s;
+                }
+                _ => return Err(corrupt(format!("blocks {phys:#x}+{blocks} are not covered by an extent reference"))),
+            }
         }
-        if refcnt != 1 {
-            return Err(unsupported("changing data shared with clones or snapshots"));
-        }
-        x.remove(&rd, &k)?;
-        if start < phys {
-            x.upsert(&rd, fs::phys_ext_key(start), Some(fs::phys_ext_val(phys - start, owner, 1)))?;
-        }
-        if phys + blocks < start + rlen {
-            let rest = start + rlen - phys - blocks;
-            x.upsert(&rd, fs::phys_ext_key(phys + blocks), Some(fs::phys_ext_val(rest, owner, 1)))?;
-        }
-        t.space.free_run(phys, blocks);
-        self.st.data_freed += blocks;
         Ok(())
     }
 }

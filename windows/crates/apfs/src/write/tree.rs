@@ -44,6 +44,8 @@ struct MemNode {
     oid: Option<u64>,
     /// Where the node was read from; freed when it is rewritten.
     paddr: Option<u64>,
+    /// Transaction that wrote the block at `paddr` (`u64::MAX` for none).
+    xid: u64,
     dirty: bool,
     /// Removed from the tree; its block must be freed.
     dead: bool,
@@ -78,6 +80,9 @@ pub struct Tree {
     root: usize,
     node_size: usize,
     changed: bool,
+    /// Blocks written at or before this transaction belong to a snapshot
+    /// too: rewriting or dropping a node leaves them in place (0: none do).
+    pub keep_xid: u64,
 }
 
 type Path = Vec<(usize, usize)>;
@@ -100,6 +105,7 @@ impl Tree {
             root: 0,
             node_size: node.data.len(),
             changed: false,
+            keep_xid: 0,
         };
         t.root = t.adopt(&node, paddr)?;
         Ok(t)
@@ -118,7 +124,7 @@ impl Tree {
             });
         }
         let oid = (self.storage == Storage::Virtual).then_some(node.hdr.oid);
-        self.nodes.push(MemNode { level: node.level, keys, vals, oid, paddr: Some(paddr), dirty: false, dead: false });
+        self.nodes.push(MemNode { level: node.level, keys, vals, oid, paddr: Some(paddr), xid: node.hdr.xid, dirty: false, dead: false });
         Ok(self.nodes.len() - 1)
     }
 
@@ -398,6 +404,7 @@ impl Tree {
                 vals: right_vals,
                 oid: None,
                 paddr: None,
+                xid: u64::MAX,
                 dirty: true,
                 dead: false,
             });
@@ -410,12 +417,14 @@ impl Tree {
                 let left_first = self.nodes[n].keys[0].clone();
                 let oid = self.nodes[n].oid.take();
                 let paddr = self.nodes[n].paddr.take();
+                let xid = std::mem::replace(&mut self.nodes[n].xid, u64::MAX);
                 self.nodes.push(MemNode {
                     level: level + 1,
                     keys: vec![left_first, first],
                     vals: vec![Val::Child(Child::Mem(n)), Val::Child(Child::Mem(right))],
                     oid,
                     paddr,
+                    xid,
                     dirty: true,
                     dead: false,
                 });
@@ -446,11 +455,14 @@ impl Tree {
         next_oid: &mut u64,
     ) -> Result<Flushed> {
         let mut out = Flushed { root: 0, moved: Vec::new(), removed: Vec::new(), allocated: 0, freed: 0 };
+        let keep = self.keep_xid;
         for node in &mut self.nodes {
             if node.dead {
                 if let Some(p) = node.paddr.take() {
-                    space.free(p);
-                    out.freed += 1;
+                    if node.xid > keep {
+                        space.free(p);
+                        out.freed += 1;
+                    }
                 }
                 if let Some(oid) = node.oid {
                     out.removed.push(oid);
@@ -492,9 +504,12 @@ impl Tree {
         let paddr = w.space.alloc(w.c)?;
         w.out.allocated += 1;
         if let Some(old) = self.nodes[n].paddr.replace(paddr) {
-            w.space.free(old);
-            w.out.freed += 1;
+            if self.nodes[n].xid > self.keep_xid {
+                w.space.free(old);
+                w.out.freed += 1;
+            }
         }
+        self.nodes[n].xid = w.xid;
         let oid = match self.storage {
             Storage::Physical => paddr,
             Storage::Virtual => *self.nodes[n].oid.get_or_insert_with(|| {
@@ -542,19 +557,20 @@ fn omap_key(oid: u64, xid: u64) -> Vec<u8> {
     k
 }
 
-/// Points `oid` at `paddr` as of `xid`, dropping its older versions (there
-/// are no snapshots to keep them for).
-pub fn omap_put(t: &mut Tree, rd: &dyn Reader, oid: u64, xid: u64, paddr: u64, size: u32) -> Result<()> {
-    omap_drop(t, rd, oid)?;
+/// Points `oid` at `paddr` as of `xid`, dropping its older versions except
+/// those a snapshot still reads (written at or before `keep_xid`).
+pub fn omap_put(t: &mut Tree, rd: &dyn Reader, oid: u64, xid: u64, paddr: u64, size: u32, keep_xid: u64) -> Result<()> {
+    omap_drop(t, rd, oid, keep_xid)?;
     let mut v = 0u32.to_le_bytes().to_vec(); // flags
     v.extend(size.to_le_bytes());
     v.extend(paddr.to_le_bytes());
     t.upsert(rd, omap_key(oid, xid), Some(v))
 }
 
-/// Removes every version of `oid`.
-pub fn omap_drop(t: &mut Tree, rd: &dyn Reader, oid: u64) -> Result<()> {
-    for (k, _) in t.range(rd, &omap_key(oid, 0), &omap_key(oid + 1, 0))? {
+/// Removes the versions of `oid` written after `keep_xid`; snapshots read
+/// the older ones.
+pub fn omap_drop(t: &mut Tree, rd: &dyn Reader, oid: u64, keep_xid: u64) -> Result<()> {
+    for (k, _) in t.range(rd, &omap_key(oid, keep_xid + 1), &omap_key(oid + 1, 0))? {
         t.remove(rd, &k)?;
     }
     Ok(())

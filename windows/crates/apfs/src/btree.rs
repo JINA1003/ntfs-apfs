@@ -7,7 +7,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::bytes::{slice_at, u16_at, u32_at, u64_at};
-use crate::error::{corrupt, unsupported, Result};
+use crate::error::{corrupt, Result};
 use crate::obj::{ObjHeader, OBJECT_TYPE_BTREE, OBJECT_TYPE_BTREE_NODE};
 
 pub const BTNODE_ROOT: u16 = 0x0001;
@@ -57,9 +57,6 @@ impl Node {
         let nkeys = u32_at(&data, 36)?;
         let toc_off = u16_at(&data, 40)? as usize;
         let toc_len = u16_at(&data, 42)? as usize;
-        if flags & BTNODE_HASHED != 0 {
-            return Err(unsupported("hashed B-tree nodes (sealed system volumes)"));
-        }
         let toc_start = NODE_DATA + toc_off;
         let key_start = toc_start + toc_len;
         let val_end = if flags & BTNODE_ROOT != 0 { data.len() - BTREE_INFO_SIZE } else { data.len() };
@@ -102,7 +99,12 @@ impl Node {
         }
         let (k_off, k_len, v_off, v_len) = if self.flags & BTNODE_FIXED_KV_SIZE != 0 {
             let e = self.toc_start + i * 4;
-            let v_len = if self.is_leaf() { info.val_size as usize } else { 8 };
+            // Index values of hashed trees carry the child's SHA-256 after its id.
+            let v_len = match (self.is_leaf(), info.flags & BTREE_HASHED != 0) {
+                (true, _) => info.val_size as usize,
+                (false, true) => 40,
+                (false, false) => 8,
+            };
             (u16_at(&self.data, e)?, info.key_size as usize, u16_at(&self.data, e + 2)?, v_len)
         } else {
             let e = self.toc_start + i * 8;

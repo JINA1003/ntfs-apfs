@@ -193,6 +193,8 @@ pub struct ApfsSuperblock {
     pub root_tree_oid: u64,
     pub extentref_tree_oid: u64,
     pub snap_meta_tree_oid: u64,
+    /// Sealed volumes: the physical tree that holds file extents.
+    pub fext_tree_oid: u64,
     pub next_obj_id: u64,
     pub num_files: u64,
     pub num_directories: u64,
@@ -230,6 +232,7 @@ impl ApfsSuperblock {
             root_tree_oid: u64_at(b, 136)?,
             extentref_tree_oid: u64_at(b, 144)?,
             snap_meta_tree_oid: u64_at(b, 152)?,
+            fext_tree_oid: u64_at(b, 1032)?,
             next_obj_id: u64_at(b, 176)?,
             num_files: u64_at(b, 184)?,
             num_directories: u64_at(b, 192)?,

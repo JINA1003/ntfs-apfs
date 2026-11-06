@@ -237,7 +237,7 @@ impl Writer {
         let new = t.space.alloc(&self.c)?;
         t.writes.push((new, apsb));
         t.space.free(old);
-        let (omap, _, _) = self.omap_update(&mut t, self.c.sb.omap_oid, &[(oid, new)], &[])?;
+        let (omap, _, _) = self.omap_update(&mut t, self.c.sb.omap_oid, &[(oid, new)], &[], 0)?;
         t.nx_omap_oid = Some(omap);
         self.commit(t)
     }
@@ -251,13 +251,14 @@ impl Writer {
         }
         VolEdit { v, st: &mut st }.flush_files(&*self.dev)?;
         let VolState { tree, extref, mut apsb, data_alloced, data_freed, .. } = st;
+        let keep_xid = tree.keep_xid;
         let (mut alloced, mut freed) = (data_alloced, data_freed);
         if tree.changed() {
             let f = tree.flush(&self.c, &mut t.space, &mut t.writes, t.xid, &mut t.next_oid)?;
             if f.root != v.sb.root_tree_oid {
                 return Err(corrupt("the file-system tree root changed its object id"));
             }
-            let (omap, a, fr) = self.omap_update(t, v.sb.omap_oid, &f.moved, &f.removed)?;
+            let (omap, a, fr) = self.omap_update(t, v.sb.omap_oid, &f.moved, &f.removed, keep_xid)?;
             put_u64(&mut apsb, 128, omap); // apfs_omap_oid
             alloced += f.allocated + a;
             freed += f.freed + fr;
@@ -281,17 +282,18 @@ impl Writer {
         let new = t.space.alloc(&self.c)?;
         t.writes.push((new, apsb));
         t.space.free(old);
-        let (omap, _, _) = self.omap_update(t, self.c.sb.omap_oid, &[(v.sb.hdr.oid, new)], &[])?;
+        let (omap, _, _) = self.omap_update(t, self.c.sb.omap_oid, &[(v.sb.hdr.oid, new)], &[], 0)?;
         t.nx_omap_oid = Some(omap);
         Ok(())
     }
 
     /// Applies changes to the object map whose `omap_phys_t` is at
     /// `omap_paddr`: points each `(oid, paddr)` of `puts` at its new block
-    /// and removes the objects in `drops`. Copy-on-write: the tree's nodes and
-    /// the object map itself move. Returns the object map's new address and
-    /// the blocks allocated and freed.
-    fn omap_update(&self, t: &mut Txn, omap_paddr: u64, puts: &[(u64, u64)], drops: &[u64]) -> Result<(u64, u64, u64)> {
+    /// and removes the objects in `drops`, keeping versions written at or
+    /// before `keep_xid` (snapshots read them). Copy-on-write: the tree's
+    /// nodes and the object map itself move. Returns the object map's new
+    /// address and the blocks allocated and freed.
+    fn omap_update(&self, t: &mut Txn, omap_paddr: u64, puts: &[(u64, u64)], drops: &[u64], keep_xid: u64) -> Result<(u64, u64, u64)> {
         let mut phys = self.c.raw_block(omap_paddr)?;
         if !checksum::verify(&phys) {
             return Err(corrupt("object map checksum"));
@@ -299,10 +301,10 @@ impl Writer {
         let rd = PhysReader(&self.c);
         let mut tree = Tree::open(&rd, u64_at(&phys, 48)?, omap_cmp)?;
         for &oid in drops {
-            omap_drop(&mut tree, &rd, oid)?;
+            omap_drop(&mut tree, &rd, oid, keep_xid)?;
         }
         for &(oid, paddr) in puts {
-            omap_put(&mut tree, &rd, oid, t.xid, paddr, self.c.block_size())?;
+            omap_put(&mut tree, &rd, oid, t.xid, paddr, self.c.block_size(), keep_xid)?;
         }
         let mut no_oids = 0;
         let f = tree.flush(&self.c, &mut t.space, &mut t.writes, t.xid, &mut no_oids)?;
@@ -573,7 +575,9 @@ impl Session {
         self.begin_if_needed()?;
         let bs = self.w.c.block_size() as u64;
         let (t, _) = self.open.as_ref().unwrap();
-        if t.space.free_blocks() < bytes.div_ceil(bs) + METADATA_RESERVE / bs {
+        // Small containers (test images) keep a sixteenth of their size.
+        let reserve = METADATA_RESERVE.min(self.w.c.sb.block_count * bs / 16) / bs;
+        if t.space.free_blocks() < bytes.div_ceil(bs) + reserve {
             return Err(Error::NoSpace("the drive is full".into()));
         }
         Ok(())
@@ -840,6 +844,8 @@ pub fn check_writable(c: &Container) -> Vec<String> {
     }
     for i in 0..sb.fs_oids.len() {
         match c.volume(i) {
+            // A sealed system volume is never written; the others still can be.
+            Ok(v) if v.sb.is_sealed() => {}
             Ok(v) => {
                 if let Err(e) = VolState::open(&v) {
                     problems.push(format!("volume {i} \"{}\": {e}", v.sb.name));

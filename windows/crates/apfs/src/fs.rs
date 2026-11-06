@@ -214,21 +214,67 @@ pub struct Volume<'c> {
     omap: Omap,
     root: Arc<Node>,
     root_info: BTreeInfo,
+    /// Transaction the volume is read as of: the container's, or a snapshot's.
+    xid: u64,
 }
+
+/// A volume snapshot (`j_snap_metadata_val_t`).
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    pub xid: u64,
+    pub name: String,
+    /// Physical address of the snapshot's copy of the volume superblock.
+    pub sblock_oid: u64,
+    /// Root of the extent-reference tree the snapshot owns (physical).
+    pub extentref_tree_oid: u64,
+}
+
+const APFS_TYPE_SNAP_METADATA: u8 = 1;
 
 impl<'c> Volume<'c> {
     pub(crate) fn open(c: &'c Container, sb: ApfsSuperblock) -> Result<Self> {
         if sb.is_encrypted() {
             return Err(unsupported(format!("volume \"{}\" is encrypted", sb.name)));
         }
-        if sb.is_sealed() {
-            return Err(unsupported(format!("volume \"{}\" is a sealed system volume", sb.name)));
-        }
         let omap = Omap::load(&c.r, &c.r.read_object(sb.omap_oid)?)?;
-        let root_paddr = resolve(c, &omap, sb.root_tree_oid)?;
-        let root = c.r.read_node(root_paddr)?;
+        Self::with_omap(c, sb, omap, c.xid())
+    }
+
+    fn with_omap(c: &'c Container, sb: ApfsSuperblock, omap: Omap, xid: u64) -> Result<Self> {
+        let root = c.r.read_node(resolve(c, &omap, sb.root_tree_oid, xid)?)?;
         let root_info = root.info()?;
-        Ok(Self { c, sb, omap, root, root_info })
+        Ok(Self { c, sb, omap, root, root_info, xid })
+    }
+
+    /// The volume's snapshots, oldest first.
+    pub fn snapshots(&self) -> Result<Vec<Snapshot>> {
+        let mut out = Vec::new();
+        if self.sb.snap_meta_tree_oid == 0 {
+            return Ok(out);
+        }
+        let root = self.c.r.read_node(self.sb.snap_meta_tree_oid)?;
+        let info = root.info()?;
+        btree::scan(&self.c.r, &root, &info, &|p| Ok(p), &|_| Ok(Ordering::Equal), &mut |k, v| {
+            let hdr = u64_at(k, 0)?;
+            if (hdr >> OBJ_TYPE_SHIFT) as u8 == APFS_TYPE_SNAP_METADATA {
+                let name_len = u16_at(v, 48)? as usize;
+                out.push(Snapshot {
+                    xid: hdr & OBJ_ID_MASK,
+                    name: cstr(slice_at(v, 50, name_len)?),
+                    sblock_oid: u64_at(v, 8)?,
+                    extentref_tree_oid: u64_at(v, 0)?,
+                });
+            }
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// The volume as it was when snapshot `s` was taken: the snapshot's
+    /// superblock copy, read through the volume's current object map.
+    pub fn snapshot(&self, s: &Snapshot) -> Result<Volume<'c>> {
+        let sb = ApfsSuperblock::parse(&self.c.r.read_object(s.sblock_oid)?)?;
+        Self::with_omap(self.c, sb, self.omap.clone(), s.xid)
     }
 
     pub fn root(&self) -> Result<Inode> {
@@ -376,6 +422,14 @@ impl<'c> Volume<'c> {
 
     pub(crate) fn extents(&self, obj_id: u64) -> Result<Vec<Extent>> {
         let mut out = Vec::new();
+        if self.sb.is_sealed() {
+            let window = |k: &[u8]| Ok(u64_at(k, 0)?.cmp(&obj_id));
+            self.scan_fext(&window, &mut |k, v| {
+                out.push(Extent { logical: u64_at(k, 8)?, len: u64_at(v, 0)? & J_FILE_EXTENT_LEN_MASK, phys_block: u64_at(v, 8)? });
+                Ok(true)
+            })?;
+            return Ok(out);
+        }
         self.records(obj_id, APFS_TYPE_FILE_EXTENT, &mut |k, v| {
             out.push(Extent {
                 logical: u64_at(k, 8)?,
@@ -481,14 +535,31 @@ impl<'c> Volume<'c> {
 
     /// A file-system tree node by object id, and the block it was read from.
     pub(crate) fn fs_node(&self, oid: u64) -> Result<(Arc<Node>, u64)> {
-        let paddr = resolve(self.c, &self.omap, oid)?;
+        let paddr = resolve(self.c, &self.omap, oid, self.xid)?;
         Ok((self.c.r.read_node(paddr)?, paddr))
     }
 
     /// Visits every record in the file-system tree, in key order.
     pub fn scan_all(&self, f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>) -> Result<()> {
-        let resolve = |oid: u64| resolve(self.c, &self.omap, oid);
+        let resolve = |oid: u64| resolve(self.c, &self.omap, oid, self.xid);
         btree::scan(&self.c.r, &self.root, &self.root_info, &resolve, &|_| Ok(Ordering::Equal), f)
+    }
+
+    /// Sealed volumes keep file extents in their own physical tree
+    /// (`fext_tree_oid`), keyed by (data stream id, logical address) with
+    /// `j_file_extent_val_t` values. Visits the records inside `window`;
+    /// nothing for other volumes.
+    pub fn scan_fext(
+        &self,
+        window: &dyn Fn(&[u8]) -> Result<Ordering>,
+        f: &mut dyn FnMut(&[u8], &[u8]) -> Result<bool>,
+    ) -> Result<()> {
+        if !self.sb.is_sealed() {
+            return Ok(());
+        }
+        let root = self.c.r.read_node(self.sb.fext_tree_oid)?;
+        let info = root.info()?;
+        btree::scan(&self.c.r, &root, &info, &|p| Ok(p), window, f)
     }
 
     /// Visits every record of object `id` with the given record type.
@@ -498,15 +569,15 @@ impl<'c> Volume<'c> {
             let hdr = u64_at(k, 0)?;
             Ok((hdr & OBJ_ID_MASK, (hdr >> OBJ_TYPE_SHIFT) as u8).cmp(&want))
         };
-        let resolve = |oid: u64| resolve(self.c, &self.omap, oid);
+        let resolve = |oid: u64| resolve(self.c, &self.omap, oid, self.xid);
         btree::scan(&self.c.r, &self.root, &self.root_info, &resolve, &window, f)
     }
 }
 
 /// Physical address of the newest version of a volume's virtual object.
-fn resolve(c: &Container, omap: &Omap, oid: u64) -> Result<u64> {
+fn resolve(c: &Container, omap: &Omap, oid: u64, xid: u64) -> Result<u64> {
     let v = omap
-        .lookup(&c.r, oid, c.xid())?
+        .lookup(&c.r, oid, xid)?
         .ok_or_else(|| corrupt(format!("virtual object {oid:#x} missing from the volume object map")))?;
     if v.flags & OMAP_VAL_ENCRYPTED != 0 {
         return Err(unsupported("encrypted file-system tree nodes"));
